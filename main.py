@@ -1,12 +1,16 @@
+import asyncio
+import functools
 import logging
 import os
 import discord
 import torch
-import lightning as L
+import torch.nn.functional as F
 from discord.ext import commands
 from dotenv import load_dotenv
-from model import BiLSTMClassifier
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
@@ -17,11 +21,42 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-model = BiLSTMClassifier.load_from_checkpoint("bilstm_final.ckpt")
+model_id = "model/deberta_best_model"
+model = AutoModelForSequenceClassification.from_pretrained(
+    model_id,
+    use_safetensors=True,
+    num_labels=2,
+)
+model.to(device)
 model.eval()
 
-tokenizer_name = "bert-base-uncased"
-tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+# tokenizer_name = "bert-base-uncased"
+tokenizer = AutoTokenizer.from_pretrained(
+    model_id,
+    fix_mistral_regex=True,
+)
+
+def predict_async(text):
+    inputs = tokenizer(
+        text,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=128,
+    ).to(device)
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+
+    logits = outputs.logits
+    probs = F.softmax(logits, dim=-1)
+
+    hate_speech_prob = probs[0][1].item()
+
+    predicted_label = torch.argmax(logits, dim=-1).item()
+    confidence = probs[0, predicted_label].item()
+
+    return hate_speech_prob, confidence
 
 @bot.event
 async def on_ready():
@@ -32,24 +67,18 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
-    inputs = tokenizer(
-        message.content,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=128,
+    THRESHOLD = 0.75
+
+    loop = asyncio.get_event_loop()
+    hate_speech_prob, confidence = await loop.run_in_executor(
+        None,
+        functools.partial(predict_async, message.content),
     )
-    input_ids = inputs["input_ids"]
-    embedding_layer = torch.nn.Embedding(num_embeddings=tokenizer.vocab_size, embedding_dim=150)
-    embedded_inputs = embedding_layer(input_ids)
 
-    with torch.no_grad():
-        outputs = model(embedded_inputs)
-
-    if outputs[0][0] > -5.0:
-        await message.reply(f"Wylkryto mowę nienawiści! | {outputs}")
+    if hate_speech_prob > THRESHOLD:
+        await message.reply(f"Wykryto mowę nienawiści! ({confidence * 100:.2f})")
     else:
-        await message.reply(f"Wszystko dobrze. | {outputs}")
+        await message.reply(f"Wszystko dobrze. ({confidence * 100:.2f})")
 
     await bot.process_commands(message)
 
